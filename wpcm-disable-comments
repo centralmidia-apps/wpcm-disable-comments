@@ -1,0 +1,190 @@
+<?php
+/*
+Plugin Name: wpcm-disable-comments
+Description: Desativa completamente os comentários em todas as áreas do site WordPress com recursos avançados de segurança e performance.
+Version: 2.1
+Author: Daniel Olveira da Paixao
+Text Domain: desativar-comentarios
+Domain Path: /languages
+*/
+
+// Evitar acesso direto ao arquivo
+if (!defined('ABSPATH')) {
+    exit('Acesso direto não permitido');
+}
+
+class DesativarComentariosAvancado {
+    private static $instance = null;
+    private $options;
+    private $original_comment_status;
+
+    // Singleton pattern
+    public static function get_instance() {
+        if (null === self::$instance) {
+            self::$instance = new self();
+        }
+        return self::$instance;
+    }
+
+    private function __construct() {
+        $this->options = get_option('dc_options', []);
+        $this->init_hooks();
+    }
+
+    private function init_hooks() {
+        // Hooks de ativação/desativação
+        register_activation_hook(__FILE__, [$this, 'activate']);
+        register_deactivation_hook(__FILE__, [$this, 'deactivate']);
+
+        // Hooks de administração
+        add_action('admin_init', [$this, 'disable_comments_admin']);
+        add_action('admin_menu', [$this, 'remove_comments_menu']);
+        add_action('wp_dashboard_setup', [$this, 'remove_dashboard_widgets']);
+        add_action('wp_before_admin_bar_render', [$this, 'remove_admin_bar_items']);
+
+        // Hooks do frontend
+        add_action('init', [$this, 'disable_comments_frontend'], 10);
+        add_filter('comments_array', [$this, 'hide_existing_comments'], 10, 2);
+
+        // Hooks de performance
+        add_action('wp_loaded', [$this, 'remove_comment_support']);
+        add_action('template_redirect', [$this, 'remove_comment_query']);
+
+        // Internacionalização
+        add_action('plugins_loaded', [$this, 'load_textdomain']);
+    }
+
+    public function activate() {
+        if (!current_user_can('activate_plugins')) {
+            return;
+        }
+
+        global $wpdb;
+
+        // Armazenar status original de comentários para possível reversão
+        $this->original_comment_status = [];
+        
+        // Atualizar status dos comentários usando prepared statement
+        $post_types = get_post_types(['public' => true], 'names');
+        foreach ($post_types as $post_type) {
+            $wpdb->query(
+                $wpdb->prepare("
+                    UPDATE $wpdb->posts 
+                    SET comment_status = %s, ping_status = %s 
+                    WHERE post_type = %s", 
+                    'closed', 'closed', $post_type
+                )
+            );
+        }
+
+        // Limpar cache apenas se houve atualização no banco de dados
+        wp_cache_flush();
+
+        // Salvar a versão e configurações do plugin
+        update_option('dc_version', '2.1');
+        update_option('dc_options', ['original_comment_status' => $this->original_comment_status]);
+    }
+
+    public function deactivate() {
+        // Restaura o status original dos comentários, se houver
+        if (isset($this->options['original_comment_status']) && is_array($this->options['original_comment_status'])) {
+            global $wpdb;
+            foreach ($this->options['original_comment_status'] as $post_id => $status) {
+                $wpdb->update(
+                    $wpdb->posts,
+                    [
+                        'comment_status' => $status['comment_status'],
+                        'ping_status' => $status['ping_status']
+                    ],
+                    ['ID' => $post_id]
+                );
+            }
+        }
+
+        // Limpar opções ao desativar
+        delete_option('dc_options');
+        delete_option('dc_version');
+        wp_cache_flush();
+    }
+
+    public function disable_comments_admin() {
+        if (!current_user_can('manage_options')) {
+            return;
+        }
+
+        // Redirecionar página de comentários
+        global $pagenow;
+        if ($pagenow === 'edit-comments.php') {
+            wp_safe_redirect(admin_url());
+            exit;
+        }
+
+        // Remover suporte a comentários
+        $this->remove_comment_support();
+    }
+
+    public function remove_comment_support() {
+        $post_types = get_post_types(['public' => true], 'names');
+        foreach ($post_types as $post_type) {
+            if (post_type_supports($post_type, 'comments')) {
+                remove_post_type_support($post_type, 'comments');
+                remove_post_type_support($post_type, 'trackbacks');
+            }
+        }
+    }
+
+    public function remove_comments_menu() {
+        if (current_user_can('manage_options')) {
+            remove_menu_page('edit-comments.php');
+            remove_submenu_page('options-general.php', 'discussion');
+        }
+    }
+
+    public function remove_dashboard_widgets() {
+        remove_meta_box('dashboard_recent_comments', 'dashboard', 'normal');
+    }
+
+    public function remove_admin_bar_items() {
+        global $wp_admin_bar;
+        $wp_admin_bar->remove_menu('comments');
+    }
+
+    public function disable_comments_frontend() {
+        // Desabilitar feed de comentários
+        remove_action('wp_head', 'feed_links_extra', 3);
+
+        // Remover campos de comentários do header
+        remove_action('wp_head', 'wp_generator');
+        remove_action('wp_head', 'wlwmanifest_link');
+
+        // Filtros para desabilitar comentários
+        add_filter('comments_open', '__return_false', 20);
+        add_filter('pings_open', '__return_false', 20);
+        add_filter('feed_links_show_comments_feed', '__return_false');
+    }
+
+    public function hide_existing_comments($comments) {
+        return [];
+    }
+
+    public function remove_comment_query() {
+        // Remover queries relacionadas a comentários para melhorar performance
+        remove_action('wp_head', 'wp_resource_hints', 2);
+        remove_action('template_redirect', 'rest_output_link_header', 11);
+    }
+
+    public function load_textdomain() {
+        load_plugin_textdomain(
+            'desativar-comentarios',
+            false,
+            dirname(plugin_basename(__FILE__)) . '/languages'
+        );
+    }
+}
+
+// Inicializar o plugin
+function init_desativar_comentarios() {
+    return DesativarComentariosAvancado::get_instance();
+}
+
+add_action('plugins_loaded', 'init_desativar_comentarios');
